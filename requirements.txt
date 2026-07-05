@@ -1,0 +1,10 @@
+requests>=2.32
+beautifulsoup4>=4.12
+python-whois>=0.9
+python-dotenv>=1.0
+resend>=2.0
+tldextract>=5.1
+
+# Optional JS-rendering fallback (set USE_PLAYWRIGHT=1 in .env):
+#   pip install playwright && playwright install chromium
+# playwright>=1.45

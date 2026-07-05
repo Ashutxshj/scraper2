@@ -1,0 +1,10 @@
+.env
+proxies.txt
+output/
+delhi_ncr_leads*.csv
+whois_cache.json
+age_cache.json
+__pycache__/
+*.pyc
+.venv/
+venv/

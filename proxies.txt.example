@@ -1,0 +1,7 @@
+# Rotating proxy pool — copy to proxies.txt and add one proxy per line.
+# Format: scheme://[user:pass@]host:port   (http, https, or socks5)
+# Lines starting with # are ignored.
+#
+# http://user:pass@123.45.67.89:8000
+# http://123.45.67.89:3128
+# socks5://user:pass@98.76.54.32:1080

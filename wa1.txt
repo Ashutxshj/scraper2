@@ -1,0 +1,424 @@
+================================================================================
+ report-generator — HOW THIS WORKER WORKS
+ (Mailbox Health Report: HTML build -> PDF render -> Resend email -> Mongo log)
+================================================================================
+ Repo:      C:\Users\Ashut\OneDrive\Desktop\Work\report-generator
+ Runtime:   Node.js 20 + Express (a small stateless HTTP microservice)
+ Purpose:   Turn a deliverability-scan payload into a branded dark-theme PDF
+            report and email it (as an attachment) to a lead, via Resend.
+ Deploy:    Dokploy + Nixpacks. Chromium is installed by Nix (not Puppeteer's
+            bundled binary) and Puppeteer is pointed at it.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. ONE-PARAGRAPH SUMMARY
+--------------------------------------------------------------------------------
+This is NOT a self-triggering cron worker. It is a request-driven HTTP service.
+An upstream backend (the "ismymailboxburnt" / mailbox-check backend) runs the
+actual deliverability scan, then POSTs the results to this service's POST
+/generate endpoint. This service immediately answers `{ queued: true }` and then,
+in the background (fire-and-forget), does three things in sequence:
+   1. Builds a full HTML document from the payload  (src/template.js)
+   2. Renders that HTML to a multi-page A4 PDF using headless Chromium +
+      a screenshot-to-PDF slicer                    (src/pdf.js)
+   3. Emails the PDF as an attachment through Resend (src/mailer.js)
+   4. Records the recipient (the "lead") in MongoDB  (src/mongo.js)
+The email has no HTML body at all — just a subject line and the PDF attachment.
+
+
+--------------------------------------------------------------------------------
+1. FILE MAP (what each file owns)
+--------------------------------------------------------------------------------
+  src/index.js     Boots Express, JSON body parser (15mb limit), mounts routes,
+                   connects Mongo, listens on PORT (env, default 3015).
+  src/routes.js    3 routes: GET /health, POST /generate, POST /preview.
+  src/generate.js  The orchestrator. handleGenerate() = the whole worker flow.
+                   handlePreview() = build+return raw HTML (no PDF, no email).
+  src/template.js  674 lines. Pure function buildHtml(payload) -> HTML string.
+                   All the visual/report logic lives here (bento tiles, charts,
+                   per-mailbox cards, verdict block, footer, section layout).
+  src/pdf.js       generatePdf(html) -> PDF Buffer. Puppeteer screenshot +
+                   custom section-aware page slicer built with pdfkit.
+  src/mailer.js    sendEmail(...) -> Resend send with base64 PDF attachment.
+  src/mongo.js     connectMongo() + saveReportSend() -> logs each delivered
+                   report into the `report_sends` collection.
+  src/assets/*.png sendkit.png, inboxkit.png, enrich.png — partner logos,
+                   embedded as base64 data URIs in the footer.
+  test-pdf.js      Local harness: buildHtml -> generatePdf -> writes test-output.pdf
+                   (bypasses HTTP + email; good for iterating on the template).
+  nixpacks.toml    Build config: installs nodejs_20 + chromium; sets
+                   PUPPETEER_SKIP_DOWNLOAD=true and PUPPETEER_EXECUTABLE_PATH.
+  .env             RESEND_API_KEY, RESEND_FROM_EMAIL, PORT (+ MONGO_URL/MONGO_DB
+                   used by mongo.js if present).
+
+
+--------------------------------------------------------------------------------
+2. WHERE THIS SITS IN THE BIGGER SYSTEM (who calls it)
+--------------------------------------------------------------------------------
+The caller is NOT in this repo. Sibling repo evidence
+(C:\Users\Ashut\OneDrive\Desktop\Work\ismymailboxburnt) shows the chain:
+
+  [ Browser / Landing page or Dashboard ]  (React app, ismymailboxburnt/src)
+        |
+        |  User finishes a mailbox scan, clicks "Get the full report",
+        |  enters email + qualifiers (count / tool / pain points).
+        |  FlowModal.tsx POSTs to the app's OWN backend:
+        |     POST {API_BASE}/report/send      (OAuth flow — results ready)
+        |     POST {API_BASE}/report/request   (API-key flow — scan runs later)
+        v
+  [ ismymailboxburnt / mailbox-check BACKEND ]  (separate service, not in repo)
+        |  Runs / finishes the deliverability scan, assembles the payload,
+        |  then POSTs it to THIS service:
+        v
+  [ report-generator ]  POST /generate   <-- THIS REPO
+        |  Builds HTML -> PDF -> emails via Resend -> logs to Mongo
+        v
+  [ Resend ]  --> delivers PDF attachment to the lead's inbox
+  [ MongoDB burnt.report_sends ] <-- lead record stored
+
+So: this worker is a downstream PDF+email microservice. It trusts its caller;
+it does not run scans, does not talk to mail providers, does not authenticate
+requests (no API key / JWT check on /generate).
+
+
+--------------------------------------------------------------------------------
+3. THE HTTP API SURFACE (src/routes.js)
+--------------------------------------------------------------------------------
+  GET  /health   -> { ok: true }              Liveness probe.
+
+  POST /generate -> { queued: true } (immediately, HTTP 200)
+                    or 400 on validation failure.
+                    Triggers the async build+send pipeline (see section 5).
+
+  POST /preview  -> text/html                 Returns the built HTML directly
+                    (for eyeballing the report in a browser). No PDF, no email,
+                    no Mongo. Same buildHtml() the real flow uses.
+
+
+--------------------------------------------------------------------------------
+4. THE REQUEST PAYLOAD (what POST /generate expects)
+--------------------------------------------------------------------------------
+JSON body (parsed with a 15 MB limit — bulk runs can be large):
+
+  {
+    "to":            "lead@company.com",   // REQUIRED. Recipient (the lead).
+    "mailboxEmail":  "sales@acme.com",     // REQUIRED. The scanned mailbox
+                                           //   (or first one, in bulk runs).
+    "verdict":       "burnt" | "healthy" | "unknown",   // REQUIRED.
+    "signals":       [ ... ],              // REQUIRED array. Per-check results.
+    "analyticsDetail": { ... } | null,     // OPTIONAL. 30-day stats + bulk data.
+    "qualifiers":    { count, tool, pain[] } // OPTIONAL. Scan-setup context.
+  }
+
+  signal item shape:
+    { label, result: "pass"|"fail"|"pending"|"na",
+      category: "auth"|"reputation"|"behavior", detail: "..." }
+
+  analyticsDetail (single-mailbox shape): totalSent, totalReceived, replies,
+    hardBounces, softBounces, warmupSent, responseRate, spfPassRate,
+    dkimPassRate, dmarcPassRate, overallBounceRate, bounceCauses[],
+    bouncedDomains[], history{spf,dkim,dmarc}...
+
+  analyticsDetail (BULK shape — triggers a different report layout):
+    _isBulk: true  OR  mailboxDetails: [ ... ]   (either flag switches to bulk)
+    Bulk aggregate fields are prefixed/named differently and get normalised in
+    template.js (totalReplied, totalBounceHard, totalBounceSoft, totalWarmupSent,
+    avgResponseRate, mailboxCount, burntCount, unknownCount, healthyCount,
+    avgBounceRate...). Each mailboxDetails[] item: {email/uid, status, sent,
+    bounced, replied, reasons[], signals{spf,dkim,dmarc,blacklist}}.
+
+VALIDATION (generate.js): rejects (400) unless `to`, `mailboxEmail`, `verdict`
+are present, `signals` is an array, and `to` contains "@". Everything else is
+optional and defensively defaulted.
+
+
+--------------------------------------------------------------------------------
+5. THE WORKER FLOW IN DETAIL (src/generate.js -> handleGenerate)
+--------------------------------------------------------------------------------
+Step A — Validate (synchronous). On failure return 400 and stop.
+
+Step B — Respond EARLY:  res.json({ queued: true })
+         The HTTP response is sent BEFORE any heavy work. This keeps the caller
+         fast and non-blocking. The caller does not wait for the PDF/email.
+         (Downside: any later error is only logged here, never returned to the
+          caller — it's fire-and-forget, no retry, no status callback.)
+
+Step C — Background pipeline (inside try/catch, errors just console.error'd):
+
+   1. html = buildHtml({...})                         // template.js, section 7
+   2. pdf  = await generatePdf(html)                  // pdf.js, section 6
+   3. Compute bulkMailboxCount:
+        if analyticsDetail.mailboxDetails is an array ->
+           analyticsDetail.mailboxCount ?? mailboxDetails.length
+        else -> null
+      (This drives the "for N mailboxes" subject line & filename.)
+   4. await sendEmail({ to, mailboxEmail, verdict, pdf, bulkMailboxCount })
+   5. saveReportSend({ to, mailboxEmail, verdict, qualifiers, bulkMailboxCount })
+      (NOT awaited — best-effort Mongo insert; only runs after a successful send)
+
+   Logging breadcrumbs at each stage:
+     [generate] building HTML for <mailbox> -> <to>
+     [generate] generating PDF (<n> chars)
+     [generate] PDF ready (<n> bytes), sending via Resend
+     [generate] email sent to <to>
+   Any throw: [generate] ERROR: <message>  (swallowed — request already 200'd)
+
+
+--------------------------------------------------------------------------------
+6. PDF GENERATION — THE TECHNICALITY (src/pdf.js)
+--------------------------------------------------------------------------------
+This does NOT use Chromium's built-in page.pdf(). Instead it takes a full-page
+PNG SCREENSHOT and stitches it into an A4 PDF with pdfkit, choosing page breaks
+at real section boundaries. This is the clever/unusual part.
+
+Why screenshot instead of page.pdf()?
+  - Guarantees the PDF looks pixel-identical to the on-screen dark theme
+    (backgrounds, gradients, exact fonts) — print CSS often drops backgrounds.
+  - Lets the code control WHERE pages break so a bento tile / mailbox card is
+    never sliced in half across a page seam.
+
+6.1 Browser lifecycle
+  - getBrowser() lazily launches ONE headless Chromium and reuses it across
+    requests (browser is a module-level singleton; relaunched only if it
+    disconnects). Launch flags: --no-sandbox, --disable-setuid-sandbox,
+    --disable-dev-shm-usage, --force-color-profile=srgb.
+  - executablePath = env PUPPETEER_EXECUTABLE_PATH (the Nix Chromium in prod).
+  - Each request opens a fresh page and closes it in `finally` (page-per-request,
+    browser-forever). deviceScaleFactor DSF = 1.5 for crisp text.
+
+6.2 Render steps inside generatePdf(html):
+  1. newPage(); setViewport(900 x 1200, deviceScaleFactor 1.5).
+  2. setContent(html, { waitUntil: 'networkidle0' })  — waits for the Google
+     Fonts <link> network to go idle so fonts are loaded before the screenshot.
+  3. addStyleTag forcing  print-color-adjust: exact  on every element (belt &
+     braces so headless Chromium doesn't strip the dark backgrounds).
+  4. page.evaluate: find [data-wrapper] (the single outer report container) and
+     read the bottom Y of EACH direct child element. Each child = one report
+     "section" (header, verdict, a chart, a mailbox card, footer...). These are
+     the candidate clean cut lines.
+  5. Scale those viewport Y coords by DSF -> PNG pixel coords (sectionEndsPng).
+  6. page.screenshot({ fullPage: true, type: 'png' })  — one tall PNG of the
+     whole report.
+  7. screenshotToPdf(pngBuffer, sectionEndsPng)  -> PDF Buffer.
+
+6.3 screenshotToPdf() — the section-aware paginator (the core algorithm):
+  - Read PNG width/height straight from the PNG header bytes (pngDimensions:
+    bytes 16..19 = width, 20..23 = height, big-endian).
+  - A4 in PDF points: 595.28 x 841.89. scale = A4_W / pngWidth (px -> pts).
+    totalH = pngHeight * scale (report height in PDF points).
+  - Convert each section boundary to points (breaksPts).
+  - Walk down the page in A4_H (=841.89pt) steps. For each ideal cut position,
+    look for a section boundary within SLACK = 150pt BEFORE it. If one exists,
+    snap the cut there (so the page ends at a clean gap between sections);
+    otherwise cut at the rigid A4 boundary. Pick the boundary nearest the ideal.
+  - Build (start,end) slices from those cuts; drop any final slice < 30pt tall
+    (avoids a near-blank trailing page).
+  - Render with pdfkit (size A4, margin 0, no auto first page):
+      * openImage(pngBuffer) ONCE and reuse the image object for every page.
+        CRITICAL for size: pdfkit does NOT dedupe Buffer sources, so calling
+        doc.image(buffer) per page would re-embed the entire PNG on every page.
+        A tall bulk report would then balloon past email attachment limits.
+        Passing the opened image object embeds the PNG a single time.
+      * For each page: paint the whole A4 dark (#0E0E10) first (so any gap below
+        a short slice matches the background — no white seams), then clip to the
+        slice height and draw the image offset by -start so only that slice shows.
+  - Returns a Promise that resolves to the concatenated PDF Buffer.
+
+Net effect: a dark, multi-page A4 PDF whose page breaks land between sections,
+with the source PNG embedded exactly once.
+
+
+--------------------------------------------------------------------------------
+7. HTML / REPORT BUILDING (src/template.js) — what goes in the PDF
+--------------------------------------------------------------------------------
+buildHtml(payload) is a pure string builder — no DOM, no framework. Everything
+is inline-styled HTML (because the PDF is a screenshot, external CSS/classes add
+no value; inline styles + data: URIs are what survive setContent with no baseURL).
+
+Design system:
+  - Black-gold dark theme. Palette constants at top: BG #0E0E10, panels, INK/
+    BODY/MUTED text, plus status hues GOLD/GREEN/RED/AMBER + neutral slate/grey.
+  - "Bento" tiles: solid-colour stat cards (statCard), the big verdict block
+    (featureCard), stacked distribution bar, horizontal bar rows with SVG
+    sparklines, ranked bar lists, numbered action items, per-mailbox cards.
+  - Fonts pulled from Google Fonts (Inter / Lora / JetBrains Mono) via <link>.
+  - Partner logos (sendkit/inboxkit/enrich) read from src/assets at module load
+    and inlined as base64 data URIs (file paths wouldn't resolve under
+    setContent, which has no base URL).
+
+Single-mailbox report renders these sections (each a direct child of
+[data-wrapper] so the paginator can break between them):
+   Header (brand + "Mailbox Health Report" + date)
+   Title (scan scope = the mailbox email)
+   1. Health Overview  — big verdict block: BURNT / HEALTHY / UNKNOWN + summary
+      line auto-composed from failures ("2 auth failures · blacklist hit · ...").
+   2. Signal Distribution — stacked pass/fail/NA bar over all signals.
+   3. Authentication — SPF/DKIM/DMARC tiles (category === 'auth').
+   4. Reputation — blacklist / sender-rep tiles (category === 'reputation').
+   5. Sending Behavior — bounce/reply tiles (category === 'behavior').
+   6. 30-Day Performance — Sent/Received/Replied/Bounced/Warmup stat cards.
+   7. Authentication Pass Rates — SPF/DKIM/DMARC % tiles + bars w/ 7-day sparkline.
+   8. Bounce Breakdown — hard vs soft + top bounce causes + top bounced domains.
+   9. Recommended Actions — up to 4 prioritised, auto-generated from the failures
+      (Critical: fix auth / delist; High: clean list via Enrich.so; Medium: warm
+      up via InboxKit; else Ongoing: monthly audits / maintain DNS).
+   10. Scan Setup — the qualifiers (count / tool / pain points), if provided.
+   Footer — "Generated automatically..." + partner logo chips.
+
+Bulk report (analyticsDetail._isBulk or mailboxDetails present):
+   Skips the single-mailbox sections 1-5,7. Keeps aggregate 30-Day Performance
+   and Bounce Breakdown, then adds a "Per-Mailbox Detail" block:
+     - Summary tiles: Mailboxes / Burnt / Unknown / Healthy / Avg Bounce.
+     - ONE detailed card per FLAGGED mailbox (burnt first, then unknown), sorted
+       by bounce rate. Healthy mailboxes are only counted, not itemised.
+     - Each mailboxCard shows Sent/Bounced/Replied/Bounce%/Reply% (rates are
+       recomputed from the displayed counts for internal consistency), per-domain
+       SPF/DKIM/DMARC/BL auth chips, and the reasons it was flagged.
+   Title scope becomes "N mailboxes" instead of a single address.
+
+
+--------------------------------------------------------------------------------
+8. EMAIL SENDING — THE TECHNICALITY (src/mailer.js)
+--------------------------------------------------------------------------------
+Provider:  Resend (npm `resend`), client built once from RESEND_API_KEY.
+From:      RESEND_FROM_EMAIL, default reports@ismymailboxburned.com.
+
+sendEmail({ to, mailboxEmail, verdict, pdf, bulkMailboxCount }):
+  subject:
+     bulk  -> "Your detailed report for <N> mailboxes is here"
+     single-> "Your detailed mailbox report is here"
+  filename:
+     bulk  -> mailbox-report-bulk-<N>-mailboxes.pdf
+     single-> mailbox-report-<mailbox-with-@-and-.-as-dashes>.pdf
+  body:  NONE. There is deliberately no HTML/marketing body. Resend requires a
+         text or html field, so the subject is repeated as the plain `text`.
+         The value IS the PDF attachment.
+  attachment: single PDF, content = Buffer.from(pdf).toString('base64').
+  resend.emails.send(...) -> on error throw `Resend error: <msg>` (bubbles to
+  generate.js's catch); on success log the Resend queue id.
+
+So "automated email" here = one transactional Resend send per /generate call,
+with the report as the only payload. No templates, no open tracking in this
+service, no batching — one lead, one email, one attachment.
+
+
+--------------------------------------------------------------------------------
+9. PERSISTENCE / LEAD LOGGING (src/mongo.js)
+--------------------------------------------------------------------------------
+Optional and non-fatal. On boot connectMongo() reads MONGO_URL (+ MONGO_DB,
+default "burnt"). If unset/unreachable it just warns and every Mongo helper
+becomes a no-op — report generation and email are UNAFFECTED.
+
+On successful connect it ensures indexes on report_sends: { to: 1 } and
+{ sentAt: -1 }.
+
+saveReportSend() is called AFTER a report is actually emailed (so the recipient
+list = real delivered leads). Document stored:
+  { to (lowercased), mailboxEmail, verdict, isBulk, bulkMailboxCount,
+    qualifiers, sentAt: new Date() }
+Wrapped in try/catch; failures only warn. Not awaited by generate.js.
+
+
+--------------------------------------------------------------------------------
+10. CONFIG / DEPLOY / OPERATIONAL NOTES
+--------------------------------------------------------------------------------
+  Env vars:
+    RESEND_API_KEY        (required for email)
+    RESEND_FROM_EMAIL     default reports@ismymailboxburned.com
+    PORT                  default 3015 (index.js) — .env in repo uses 3012
+    MONGO_URL / MONGO_DB  optional lead logging (DB default "burnt")
+    PUPPETEER_EXECUTABLE_PATH  set by nixpacks to the Nix Chromium
+    PUPPETEER_SKIP_DOWNLOAD=true  don't download Puppeteer's own Chromium
+
+  Deploy (nixpacks.toml, for Dokploy):
+    setup installs nodejs_20 + chromium; start cmd = `npm start` (node src/index.js).
+    The comment explains WHY: the default Nixpacks Node image has no Chromium and
+    Puppeteer's bundled one lacks required shared libs on this host.
+
+  Scaling / reliability characteristics:
+    - Single shared Chromium instance; page-per-request. Concurrency is bounded
+      by memory (each PDF render spins a page + a full-page screenshot).
+    - Fire-and-forget: caller gets {queued:true} instantly; NO retry, NO failure
+      callback. A Resend/Chromium error is only visible in this service's logs.
+    - No auth on /generate or /preview — relies on network trust / the upstream
+      backend being the only caller.
+    - Idempotency: none. Each POST = one email + one Mongo row.
+
+
+--------------------------------------------------------------------------------
+11. FULL-FLOW DIAGRAM
+--------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         UPSTREAM (other repos)                             │
+  │                                                                            │
+  │  React app (ismymailboxburnt)        Backend (mailbox-check / burnt API)   │
+  │  ── user runs mailbox scan ──►  POST {API_BASE}/report/send  or /request   │
+  │     enters email + qualifiers        │                                     │
+  │                                      │ runs the deliverability scan,       │
+  │                                      │ assembles verdict + signals +       │
+  │                                      │ analyticsDetail (+ bulk mailbox data)│
+  │                                      ▼                                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                         │  HTTP POST /generate
+                                         │  { to, mailboxEmail, verdict,
+                                         │    signals[], analyticsDetail?,
+                                         │    qualifiers? }
+                                         ▼
+  ┌────────────────────────────  report-generator (THIS REPO)  ───────────────┐
+  │                                                                            │
+  │  index.js (Express :PORT)                                                  │
+  │      │ express.json({limit:'15mb'})                                        │
+  │      ▼                                                                      │
+  │  routes.js ── POST /generate ──► generate.js: handleGenerate()             │
+  │      │                                                                      │
+  │      ├─ validate (to/mailboxEmail/verdict/signals) ── fail ──► 400         │
+  │      │                                                                      │
+  │      ├─ res.json({ queued:true })   ◄── responds IMMEDIATELY (HTTP 200)    │
+  │      │                                                                      │
+  │      └─ (async, fire-and-forget) ─────────────────────────────────┐       │
+  │                                                                    │       │
+  │         1) template.js  buildHtml(payload)                         │       │
+  │              • pure string builder, inline-styled dark theme       │       │
+  │              • single vs BULK layout                               │       │
+  │              • logos inlined as base64 data URIs                   │       │
+  │                         │ HTML string                              │       │
+  │                         ▼                                          │       │
+  │         2) pdf.js  generatePdf(html)                               │       │
+  │              • reuse singleton headless Chromium (Nix binary)      │       │
+  │              • setContent(waitUntil networkidle0) -> load fonts    │       │
+  │              • force print-color-adjust:exact                      │       │
+  │              • measure [data-wrapper] children -> section cut Ys   │       │
+  │              • fullPage PNG screenshot (DSF 1.5)                   │       │
+  │              • screenshotToPdf(): snap A4 cuts to section          │       │
+  │                boundaries (150pt slack), embed PNG ONCE,           │       │
+  │                paint dark bg + clip per page (pdfkit)              │       │
+  │                         │ PDF Buffer                               │       │
+  │                         ▼                                          │       │
+  │         3) mailer.js  sendEmail(...)                               │       │
+  │              • Resend send: subject only + base64 PDF attachment   │       │
+  │              • from reports@ismymailboxburned.com                  │       │
+  │                         │ on success                               │       │
+  │                         ▼                                          │       │
+  │         4) mongo.js  saveReportSend(...)  (best-effort, optional)  │       │
+  │              • insert lead record into burnt.report_sends          │       │
+  │                                                                    │       │
+  │         (any error in 1-4 -> console.error only; no retry) ◄───────┘       │
+  │                                                                            │
+  └────────────────────────────────────────────────────────────────────────────┘
+                    │  Resend API                    │  MongoDB
+                    ▼                                 ▼
+        ┌────────────────────────┐        ┌────────────────────────────┐
+        │  Lead's inbox          │        │  burnt.report_sends         │
+        │  subject + PDF attach   │        │  {to, verdict, isBulk,      │
+        │  (no email body)        │        │   bulkMailboxCount, sentAt} │
+        └────────────────────────┘        └────────────────────────────┘
+
+  Side path (no PDF/email):
+      POST /preview  ─► buildHtml() ─► returns raw text/html (browser preview)
+      GET  /health   ─► { ok:true }
+
+================================================================================
+ END
+================================================================================
