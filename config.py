@@ -20,6 +20,10 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
 # --- Delivery (Resend, per wa1.txt report-generator theory) ---
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
@@ -53,6 +57,7 @@ NCR_CITIES = [
 # EXCLUDED_KEYWORDS below.
 BUSINESS_CATEGORIES = [
     "dentist",
+    "doctor",
     "medical clinic",
     "restaurant",
     "cafe",
@@ -84,6 +89,10 @@ EXCLUDED_KEYWORDS = [
 NCR_CITY_KEYWORDS = [
     "delhi", "noida", "gurgaon", "gurugram", "faridabad", "ghaziabad",
 ]
+# Enforce the NCR gate? Off by default: searches are NCR-city-seeded and (on
+# Apify) country-locked to India already, and nearby-city businesses that slip
+# in are still valid customers. Set NCR_ONLY=true to drop them again.
+NCR_ONLY = _env_bool("NCR_ONLY", False)
 
 # --- Lead tiers (all leads have NO website by construction) ---
 # Goldenrod: highly-rated, heavily-reviewed businesses running without a site —

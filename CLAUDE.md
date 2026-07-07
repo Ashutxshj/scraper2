@@ -43,13 +43,13 @@ Python 3.10+ (uses `X | None` syntax).
 |------|------|
 | `main.py` | Orchestrator + category menu (`pick_category()`) + CLI flags (`--mock`, `--limit N`, `--no-email`, `--category N`) + strict validation gate + `classify()` tier logic + CSV writer + `write_xlsx()` (openpyxl, gold fill on Goldenrod rows) |
 | `config.py` | Env loading, constants (cities/categories/tier thresholds), output columns |
-| `target_sourcer.py` | Source no-website places — precedence: **Apify → Google Places → `seed_places.csv` → built-in mock**. Apify actor is passed `website: "withoutWebsite"`; every mode also drops any place carrying a website client-side. Target dicts: `{business_name, phone, email, rating, reviews, address, category, place_id}`. Drops tech/digital-marketing sellers (`EXCLUDED_KEYWORDS`) and non-NCR places (`NCR_CITY_KEYWORDS` + Apify `countryCode=in`); dedup by `place_id` |
+| `target_sourcer.py` | Source no-website places — precedence: **Apify → Google Places → `seed_places.csv` → built-in mock**. Apify actor is passed `website: "withoutWebsite"`; every mode also drops any place carrying a website client-side. Target dicts: `{business_name, phone, email, rating, reviews, address, category, place_id}`. Drops tech/digital-marketing sellers (`EXCLUDED_KEYWORDS`); India-locked via Apify `countryCode=in`. Non-NCR places are KEPT by default (still customers) — set `NCR_ONLY=true` to drop them (`NCR_CITY_KEYWORDS`); dedup by `place_id` |
 | `http_client.py` | Shared HTTP layer: retry/backoff/jitter, rotating proxy pool (used by the Places API path) |
 | `contacted_registry.py` | Persistent dedup across runs: `contacted_businesses.xlsx` (project root) records every business already emailed. Loaded before `--limit` to drop repeats; appended only after a successful Resend send. Match keys: place_id, normalized phone (last 10 digits), name+address. Mock runs bypass it entirely |
 | `delivery.py` | `send_report()` — Resend emailer, attaches the one XLSX report (base64) + `sends_log.jsonl` |
 
-**Pipeline flow:** pick category → source no-website Maps places → ICP +
-NCR-location filter → **drop already-contacted businesses** (from
+**Pipeline flow:** pick category → source no-website Maps places → ICP filter
+(+ optional `NCR_ONLY` location gate) → **drop already-contacted businesses** (from
 `contacted_businesses.xlsx`) → **strict gate** (drop any row with no email AND
 no phone — note: Maps listings rarely expose emails, so most leads are
 phone-only) → classify Goldenrod / New Bark → sort (Goldenrod first, reviews
@@ -61,8 +61,8 @@ Removed relative to `/scraper`: `sitemap_filter.py`, `contact_scraper.py`,
 *have* websites.
 
 **ICP note:** target categories (`BUSINESS_CATEGORIES`) are local service businesses —
-dentists, clinics, restaurants, salons, gyms, law firms, real estate, coaching,
-consultants, shops, manufacturers, NGOs. Businesses that *sell* tech or digital-marketing
+dentists, doctors, clinics, restaurants, salons, gyms, law firms, real estate,
+coaching, consultants, shops, manufacturers, NGOs. Businesses that *sell* tech or digital-marketing
 services are never leads; they're filtered by keyword blocklist.
 
 ## Key env vars (full surface in `.env.example`)

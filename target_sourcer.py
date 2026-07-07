@@ -121,7 +121,7 @@ def _places_text_search(query: str, api_key: str) -> list[dict]:
             if place.get("websiteUri"):
                 continue  # has a website — not our lead
             address = place.get("formattedAddress", "")
-            if not _in_ncr(address):
+            if config.NCR_ONLY and not _in_ncr(address):
                 continue
             results.append({
                 "business_name": place.get("displayName", {}).get("text", ""),
@@ -205,14 +205,15 @@ def _source_from_apify(category: str | None) -> list[dict]:
         if item.get("website"):
             has_website += 1
             continue  # already online — not our lead
-        # Belt-and-braces location gate: even with countryCode=in, keep a place
-        # only if its returned address/city matches a Delhi NCR city.
+        # Location gate: countryCode=in already locks results to India; nearby
+        # non-NCR cities are kept unless NCR_ONLY is set (they're customers too).
         place_loc = " ".join(
             str(item.get(k) or "") for k in ("city", "address", "state")
         )
         if not _in_ncr(place_loc):
             outside_ncr += 1
-            continue
+            if config.NCR_ONLY:
+                continue
         emails = item.get("emails")
         targets.append({
             "business_name": item.get("title") or item.get("name", ""),
@@ -225,8 +226,10 @@ def _source_from_apify(category: str | None) -> list[dict]:
             "category": item.get("categoryName") or "",
             "place_id": item.get("placeId") or "",
         })
+    ncr_note = "dropped (NCR_ONLY=true)" if config.NCR_ONLY else "kept"
     print(f"[sourcer] Apify returned {len(items)} places "
-          f"({has_website} with a website, {outside_ncr} outside Delhi NCR — dropped)")
+          f"({has_website} with a website — dropped, "
+          f"{outside_ncr} outside Delhi NCR — {ncr_note})")
     return targets
 
 
