@@ -25,6 +25,7 @@ import sys
 from datetime import datetime
 
 import config
+import contacted_registry
 from delivery import send_report
 from target_sourcer import source_targets
 
@@ -111,6 +112,18 @@ def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> 
     # --- Stage 1: source no-website places from Google Maps ---
     targets = source_targets(mock=mock, category=category)
 
+    # Already-emailed businesses are dropped BEFORE --limit so the cap fills
+    # with fresh leads. Mock runs skip the registry so smoke tests stay green.
+    if not mock:
+        contacted = contacted_registry.load_keys()
+        if contacted:
+            before = len(targets)
+            targets = [t for t in targets
+                       if not (contacted_registry.target_keys(t) & contacted)]
+            if before - len(targets):
+                print(f"[main] {before - len(targets)} already-contacted "
+                      f"businesses skipped (see {config.CONTACTED_FILE})")
+
     if limit > 0:
         targets = targets[:limit]
     if not targets:
@@ -149,6 +162,8 @@ def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> 
             "Reviews": target.get("reviews") or 0,
             "Address": target.get("address") or "",
             "Lead Type": lead_type,
+            # Not a report column — carried for the contacted registry only.
+            "Place ID": target.get("place_id") or "",
         })
 
     # Goldenrod first, then by review count within each tier.
@@ -163,7 +178,8 @@ def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> 
     latest_path = os.path.join(config.OUTPUT_DIR, f"{config.OUTPUT_BASENAME}_latest.csv")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=config.CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=config.CSV_COLUMNS,
+                                extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     shutil.copyfile(csv_path, latest_path)  # stable path for quick access
@@ -188,8 +204,14 @@ def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> 
     else:
         # One attachment only: the styled XLSX (all leads, both tiers, Goldenrod
         # rows highlighted). CSV is the fallback if openpyxl isn't installed.
-        send_report([xlsx_written or csv_path],
-                    goldenrod=goldenrod, new_bark=new_bark)
+        sent = send_report([xlsx_written or csv_path],
+                           goldenrod=goldenrod, new_bark=new_bark)
+        # Record ONLY what actually went out: an unsent lead stays eligible
+        # for the next run. Mock leads never enter the registry.
+        if sent and not mock:
+            added = contacted_registry.record(rows)
+            print(f"[main] {added} businesses recorded in {config.CONTACTED_FILE} "
+                  "— they will be skipped in future runs")
 
     return 0
 

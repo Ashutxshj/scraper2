@@ -128,3 +128,8 @@ CSV_COLUMNS = [
     "Rating", "Reviews", "Address", "Lead Type",
 ]
 SENDS_LOG_FILE = os.path.join(OUTPUT_DIR, "sends_log.jsonl")
+
+# Registry of every business already emailed in a past report (see
+# contacted_registry.py). Lives in the project root so it survives runs;
+# businesses in it are skipped by future runs and never re-emailed.
+CONTACTED_FILE = os.getenv("CONTACTED_FILE", "contacted_businesses.xlsx")

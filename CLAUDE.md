@@ -45,13 +45,16 @@ Python 3.10+ (uses `X | None` syntax).
 | `config.py` | Env loading, constants (cities/categories/tier thresholds), output columns |
 | `target_sourcer.py` | Source no-website places — precedence: **Apify → Google Places → `seed_places.csv` → built-in mock**. Apify actor is passed `website: "withoutWebsite"`; every mode also drops any place carrying a website client-side. Target dicts: `{business_name, phone, email, rating, reviews, address, category, place_id}`. Drops tech/digital-marketing sellers (`EXCLUDED_KEYWORDS`) and non-NCR places (`NCR_CITY_KEYWORDS` + Apify `countryCode=in`); dedup by `place_id` |
 | `http_client.py` | Shared HTTP layer: retry/backoff/jitter, rotating proxy pool (used by the Places API path) |
+| `contacted_registry.py` | Persistent dedup across runs: `contacted_businesses.xlsx` (project root) records every business already emailed. Loaded before `--limit` to drop repeats; appended only after a successful Resend send. Match keys: place_id, normalized phone (last 10 digits), name+address. Mock runs bypass it entirely |
 | `delivery.py` | `send_report()` — Resend emailer, attaches the one XLSX report (base64) + `sends_log.jsonl` |
 
 **Pipeline flow:** pick category → source no-website Maps places → ICP +
-NCR-location filter → **strict gate** (drop any row with no email AND no phone —
-note: Maps listings rarely expose emails, so most leads are phone-only) →
-classify Goldenrod / New Bark → sort (Goldenrod first, reviews desc) → write
-CSV + styled XLSX → email the XLSX.
+NCR-location filter → **drop already-contacted businesses** (from
+`contacted_businesses.xlsx`) → **strict gate** (drop any row with no email AND
+no phone — note: Maps listings rarely expose emails, so most leads are
+phone-only) → classify Goldenrod / New Bark → sort (Goldenrod first, reviews
+desc) → write CSV + styled XLSX → email the XLSX → on send success, append the
+emailed businesses to `contacted_businesses.xlsx`.
 
 Removed relative to `/scraper`: `sitemap_filter.py`, `contact_scraper.py`,
 `fresh_domains.py` (and `--fresh`) — all only make sense for businesses that
