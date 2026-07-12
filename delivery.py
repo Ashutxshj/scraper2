@@ -16,6 +16,7 @@ import os
 from datetime import datetime, timezone
 
 import config
+import master_registry
 
 
 def _log_send(record: dict) -> None:
@@ -28,50 +29,49 @@ def _log_send(record: dict) -> None:
         print(f"[delivery] WARN: could not write send log: {exc}")
 
 
-def send_report(paths: list[str], goldenrod: int, new_bark: int) -> bool:
-    """Email the report files (XLSX + CSV) as base64 attachments via Resend.
-    Returns True on success."""
-    if not config.RESEND_API_KEY:
-        print("[delivery] RESEND_API_KEY not set — skipping email "
-              f"(files are on disk: {', '.join(paths)})")
+def send_master(new_leads: int, goldenrod: int = 0, new_bark: int = 0) -> bool:
+    """Email the master workbook as a base64 attachment. True on success."""
+    path = master_registry.MASTER_FILE
+    if not config.RESEND_API_KEY or not config.RECIPIENT_EMAIL:
+        print("[delivery] RESEND_API_KEY/RECIPIENT_EMAIL not set — skipping email "
+              f"(master is on disk at {path})")
+        return False
+    if not os.path.exists(path):
+        print(f"[delivery] no master workbook at {path} — nothing to send")
         return False
 
     import resend
     resend.api_key = config.RESEND_API_KEY
 
-    attachments = []
-    for path in paths:
-        with open(path, "rb") as f:
-            attachments.append({
-                "filename": os.path.basename(path),
-                "content": base64.b64encode(f.read()).decode("ascii"),
-            })
+    with open(path, "rb") as f:
+        content_b64 = base64.b64encode(f.read()).decode("ascii")
 
-    total = goldenrod + new_bark
-    subject = (f"Delhi NCR no-website leads: {total} total "
-               f"({goldenrod} Goldenrod, {new_bark} New Bark)")
+    filename = os.path.basename(path)
+    total = len(master_registry.load_rows())
+    subject = (f"Delhi NCR no-website leads: {new_leads} new "
+               f"({goldenrod} Goldenrod, {new_bark} New Bark) — master holds {total}")
 
-    print(f"[delivery] sending {len(attachments)} file(s) "
-          f"({total} leads) to {config.RECIPIENT_EMAIL}")
+    print(f"[delivery] sending {filename} ({new_leads} new) to {config.RECIPIENT_EMAIL}")
     try:
         result = resend.Emails.send({
             "from": config.RESEND_FROM_EMAIL,
             "to": [config.RECIPIENT_EMAIL],
             "subject": subject,
             "text": subject,  # no HTML body — the value IS the attachment
-            "attachments": attachments,
+            "attachments": [{"filename": filename, "content": content_b64}],
         })
     except Exception as exc:
         print(f"[delivery] ERROR: Resend send failed: {exc}")
-        print(f"[delivery] files preserved at {', '.join(paths)}")
+        print(f"[delivery] master preserved at {path}")
         return False
 
     send_id = result.get("id") if isinstance(result, dict) else getattr(result, "id", None)
     print(f"[delivery] email sent to {config.RECIPIENT_EMAIL} (resend id: {send_id})")
     _log_send({
         "to": config.RECIPIENT_EMAIL.lower(),
-        "filenames": [os.path.basename(p) for p in paths],
-        "leadCount": total,
+        "filename": filename,
+        "newLeads": new_leads,
+        "totalLeads": total,
         "goldenrod": goldenrod,
         "newBark": new_bark,
         "resendId": send_id,

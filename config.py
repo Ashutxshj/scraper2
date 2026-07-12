@@ -129,16 +129,7 @@ USER_AGENT = (
 )
 
 # --- Output ---
-# Reports are archived here (timestamped) in addition to being emailed.
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
-OUTPUT_BASENAME = "delhi_ncr_no_website_leads"
-CSV_COLUMNS = [
-    "Business Name", "Category", "Phone Number", "Email",
-    "Rating", "Reviews", "Address", "Lead Type",
-]
-SENDS_LOG_FILE = os.path.join(OUTPUT_DIR, "sends_log.jsonl")
-
-# Registry of every business already emailed in a past report (see
-# contacted_registry.py). Lives in the project root so it survives runs;
-# businesses in it are skipped by future runs and never re-emailed.
-CONTACTED_FILE = os.getenv("CONTACTED_FILE", "contacted_businesses.xlsx")
+# Leads go straight into the ONE master workbook, Projects/leads_master.xlsx
+# (see master_registry.py). No output/ folder, no per-run CSV or XLSX, no
+# per-repo registry. Dedup lives in the master file.
+SENDS_LOG_FILE = "sends_log.jsonl"

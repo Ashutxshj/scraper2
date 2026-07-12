@@ -1,10 +1,17 @@
 """Orchestrator: pick category -> source Google Maps places with NO website ->
-STRICT VALIDATION GATE -> classify Goldenrod / New Bark -> CSV + styled XLSX -> Resend.
+STRICT VALIDATION GATE -> classify Goldenrod / New Bark -> Projects/leads_master.xlsx.
+
+Leads land in the ONE master workbook shared by every repo (master_registry.py).
+There is no output/ folder and no per-run report: businesses already in the
+master are skipped by upsert(), so re-running never duplicates a lead.
 
 Lead tiers (every lead has no website by construction):
-  * Goldenrod — rating >= 4.5 with 500+ reviews. Rendered with a golden-yellow
-    row background in the XLSX.
+  * Goldenrod — rating >= 4.5 with 500+ reviews.
   * New Bark  — every other no-website business.
+
+These leads are phone-only: Google Maps listings rarely expose an email, and
+there is no site to scrape one from. /scraper3 finds the ones reachable by
+Instagram DM instead.
 
 Usage:
   python main.py                 # full run (Apify / Places API / seed_places.csv)
@@ -18,15 +25,12 @@ source only that category (e.g. 1 = dentist), or press Enter / 0 for all.
 """
 
 import argparse
-import csv
 import os
-import shutil
 import sys
-from datetime import datetime
 
 import config
-import contacted_registry
-from delivery import send_report
+import master_registry
+from delivery import send_master
 from target_sourcer import source_targets
 
 
@@ -73,56 +77,30 @@ def classify(target: dict) -> str:
     return config.LEAD_TYPE_NEW_BARK
 
 
-def write_xlsx(rows: list[dict], path: str) -> str | None:
-    """Styled workbook: bold header, golden-yellow fill on Goldenrod rows.
-    Returns the path, or None if openpyxl isn't installed (CSV still exists)."""
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        print("[main] openpyxl not installed — skipping styled XLSX "
-              "(pip install openpyxl)")
-        return None
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Leads"
-    ws.append(config.CSV_COLUMNS)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-
-    gold = PatternFill(fill_type="solid", fgColor=config.GOLDENROD_FILL_HEX)
-    for row in rows:
-        ws.append([row[col] for col in config.CSV_COLUMNS])
-        if row["Lead Type"] == config.LEAD_TYPE_GOLDENROD:
-            for cell in ws[ws.max_row]:
-                cell.fill = gold
-
-    for i, col in enumerate(config.CSV_COLUMNS, 1):
-        width = max([len(col)] + [len(str(r[col])) for r in rows])
-        ws.column_dimensions[get_column_letter(i)].width = min(width + 2, 50)
-
-    ws.freeze_panes = "A2"
-    wb.save(path)
-    return path
+def _master_keys(target: dict) -> set[str]:
+    """Identity keys for a sourcer target, in master-column terms."""
+    return master_registry.identity_keys({
+        "Business Name": target.get("business_name", ""),
+        "Phone Number": target.get("phone", ""),
+        "Email Address": target.get("email", ""),
+        "Instagram": "",
+    })
 
 
 def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> int:
     # --- Stage 1: source no-website places from Google Maps ---
     targets = source_targets(mock=mock, category=category)
 
-    # Already-emailed businesses are dropped BEFORE --limit so the cap fills
-    # with fresh leads. Mock runs skip the registry so smoke tests stay green.
+    # Businesses already in the master are dropped BEFORE --limit so the cap
+    # fills with fresh leads. Mock runs skip it so smoke tests stay green.
     if not mock:
-        contacted = contacted_registry.load_keys()
-        if contacted:
+        known = master_registry.load_keys()
+        if known:
             before = len(targets)
-            targets = [t for t in targets
-                       if not (contacted_registry.target_keys(t) & contacted)]
+            targets = [t for t in targets if not (_master_keys(t) & known)]
             if before - len(targets):
-                print(f"[main] {before - len(targets)} already-contacted "
-                      f"businesses skipped (see {config.CONTACTED_FILE})")
+                print(f"[main] {before - len(targets)} businesses already in the "
+                      "master file — skipped")
 
     if limit > 0:
         targets = targets[:limit]
@@ -153,65 +131,51 @@ def run(mock: bool, limit: int, no_email: bool, category: str | None = None) -> 
               f"(rating={rating if rating is not None else 'n/a'}, "
               f"reviews={target.get('reviews') or 0}, phone={phone or '-'})")
 
+        reviews = target.get("reviews") or 0
         rows.append({
             "Business Name": name,
             "Category": target.get("category") or "",
-            "Phone Number": phone,
-            "Email": email,
-            "Rating": rating if rating is not None else "",
-            "Reviews": target.get("reviews") or 0,
-            "Address": target.get("address") or "",
             "Lead Type": lead_type,
-            # Not a report column — carried for the contacted registry only.
-            "Place ID": target.get("place_id") or "",
+            "Has_Website": False,
+            "Phone Number": phone,
+            "Email Address": email,
+            "Instagram": "",
+            "Rating": rating if rating is not None else "",
+            "Reviews": reviews,
+            master_registry.BULLETS_COLUMN: master_registry.no_website_bullets(
+                target.get("category"), rating, reviews),
         })
 
     # Goldenrod first, then by review count within each tier.
     rows.sort(key=lambda r: (r["Lead Type"] != config.LEAD_TYPE_GOLDENROD,
                              -(r["Reviews"] or 0)))
 
-    # --- Stage 4: write CSV + styled XLSX to the archive folder ---
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.join(config.OUTPUT_DIR, f"{config.OUTPUT_BASENAME}_{stamp}")
-    csv_path, xlsx_path = f"{base}.csv", f"{base}.xlsx"
-    latest_path = os.path.join(config.OUTPUT_DIR, f"{config.OUTPUT_BASENAME}_latest.csv")
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=config.CSV_COLUMNS,
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    shutil.copyfile(csv_path, latest_path)  # stable path for quick access
-    xlsx_written = write_xlsx(rows, xlsx_path)
+    # --- Stage 4: append to the ONE master workbook ---
+    # A --mock run must never pollute the real master with fictional businesses.
+    # Overriding MASTER_FILE (a scratch path) is the explicit opt-in used by tests.
+    if mock and not os.getenv("MASTER_FILE"):
+        print("[main] mock run — not touching the real master file")
+        added = 0
+    else:
+        added = master_registry.upsert(rows)
 
     goldenrod = stats[config.LEAD_TYPE_GOLDENROD]
     new_bark = stats[config.LEAD_TYPE_NEW_BARK]
     print(
         f"\n[main] done: sourced={stats['sourced']} no_contact={stats['no_contact']} "
-        f"kept={len(rows)} (Goldenrod={goldenrod}, New Bark={new_bark})"
+        f"kept={len(rows)} added={added} (Goldenrod={goldenrod}, New Bark={new_bark})"
     )
-    print(f"[main] CSV archived -> {csv_path}")
-    print(f"[main] latest copy  -> {latest_path}")
-    if xlsx_written:
-        print(f"[main] styled XLSX  -> {xlsx_written}")
+    print(f"[main] master -> {master_registry.MASTER_FILE}")
+    if len(rows) - added:
+        print(f"[main] {len(rows) - added} were already in the master file")
 
     # --- Stage 5: delivery (wa1.txt theory) ---
     if no_email:
         print("[main] --no-email set — skipping delivery")
-    elif not rows:
-        print("[main] 0 validated leads — skipping delivery")
+    elif not added:
+        print("[main] 0 new leads — skipping delivery")
     else:
-        # One attachment only: the styled XLSX (all leads, both tiers, Goldenrod
-        # rows highlighted). CSV is the fallback if openpyxl isn't installed.
-        sent = send_report([xlsx_written or csv_path],
-                           goldenrod=goldenrod, new_bark=new_bark)
-        # Record ONLY what actually went out: an unsent lead stays eligible
-        # for the next run. Mock leads never enter the registry.
-        if sent and not mock:
-            added = contacted_registry.record(rows)
-            print(f"[main] {added} businesses recorded in {config.CONTACTED_FILE} "
-                  "— they will be skipped in future runs")
+        send_master(added, goldenrod=goldenrod, new_bark=new_bark)
 
     return 0
 
