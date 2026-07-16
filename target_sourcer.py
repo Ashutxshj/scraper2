@@ -145,13 +145,14 @@ def _search_queries(category: str | None = None) -> list[str]:
     """The category × city cross-product used by every keyword-based source.
 
     A picked `category` (from the startup menu) narrows the sweep to just
-    that category. City-major order, so a small APIFY_MAX_SEARCHES cap slices
-    across MANY categories in Delhi rather than one category across cities.
+    that category. Category-major order: every city appears before any category
+    repeats, so a small APIFY_MAX_SEARCHES cap spreads across the whole country
+    instead of being spent entirely on Delhi.
     """
     categories = [category] if category else config.BUSINESS_CATEGORIES
     return [f"{cat} in {city}"
-            for city in config.NCR_CITIES
-            for cat in categories]
+            for cat in categories
+            for city in config.TARGET_CITIES]
 
 
 def _source_from_places(api_key: str, category: str | None) -> list[dict]:

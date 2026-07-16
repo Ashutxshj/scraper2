@@ -42,7 +42,18 @@ GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 #   business_name,phone,email,rating,reviews,address,category
 SEED_FILE = "seed_places.csv"
 
-NCR_CITIES = [
+# The cities searched, as "{category} in {city}". Delhi NCR first — the home
+# market, and the one you can meet in person — then the other metros, which are
+# just as reachable for work delivered remotely anyway.
+#
+# COST: queries = categories x cities, capped by APIFY_MAX_SEARCHES. Adding a
+# city does NOT by itself cost more; it changes what the cap is spent on. The
+# query list is category-major (see target_sourcer._search_queries), so the cap
+# spreads across every city rather than being exhausted on Delhi. Raise
+# APIFY_MAX_SEARCHES to cover more categories per city — that is the knob that
+# costs money, and it scales linearly.
+TARGET_CITIES = [
+    # Delhi NCR
     "Delhi",
     "New Delhi",
     "Noida",
@@ -50,6 +61,15 @@ NCR_CITIES = [
     "Gurgaon",
     "Faridabad",
     "Ghaziabad",
+    # The other metros
+    "Mumbai",
+    "Bengaluru",
+    "Hyderabad",
+    "Chennai",
+    "Pune",
+    "Kolkata",
+    "Ahmedabad",
+    "Jaipur",
 ]
 
 # Target customer profile: local businesses/orgs that BUY web & digital services.
