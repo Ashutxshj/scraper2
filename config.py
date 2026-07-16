@@ -27,7 +27,7 @@ def _env_bool(name: str, default: bool) -> bool:
 # --- Delivery (Resend, per wa1.txt report-generator theory) ---
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "ashutosh@06067gmail.com")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "ashutosh06066@gmail.com")
 
 # --- Sourcing ---
 # Apify Google Maps Scraper (card-free, preferred). Presence of the token
